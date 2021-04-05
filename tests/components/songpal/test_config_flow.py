@@ -58,6 +58,7 @@ def _patch_setup():
 
 async def test_flow_ssdp(hass: HomeAssistant) -> None:
     """Test working ssdp flow."""
+    mocked_device = _create_mocked_device()
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_SSDP},
@@ -72,7 +73,7 @@ async def test_flow_ssdp(hass: HomeAssistant) -> None:
     flow = _flow_next(hass, result["flow_id"])
     assert flow["context"]["unique_id"] == UDN
 
-    with _patch_setup():
+    with _patch_config_flow_device(mocked_device), _patch_setup():
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input={}
         )
@@ -191,7 +192,7 @@ async def test_user_exist(hass: HomeAssistant) -> None:
         assert result["reason"] == "already_configured"
 
     mocked_device.get_supported_methods.assert_called_once()
-    mocked_device.get_interface_information.assert_called_once()
+    mocked_device.get_interface_information.assert_not_called()
 
 
 async def test_import_exist(hass: HomeAssistant) -> None:
@@ -221,7 +222,10 @@ async def test_user_invalid(hass: HomeAssistant) -> None:
         )
         assert result["type"] == FlowResultType.FORM
         assert result["step_id"] == "user"
-        assert result["errors"] == {"base": "cannot_connect"}
+        assert result["errors"] == {
+            "endpoint": "Connection failed: Unable to do POST request: : None",
+            "base": "cannot_connect",
+        }
 
     mocked_device.get_supported_methods.assert_called_once()
     mocked_device.get_interface_information.assert_not_called()

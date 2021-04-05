@@ -85,6 +85,7 @@ def _create_mocked_device(throw_exception=False, wired_mac=MAC, wireless_mac=Non
     type(mocked_device).get_inputs = AsyncMock(return_value=[input1, input2])
 
     type(mocked_device).set_power = AsyncMock()
+    type(mocked_device).set_power_settings = AsyncMock()
     type(mocked_device).set_sound_settings = AsyncMock()
     type(mocked_device).listen_notifications = AsyncMock()
     type(mocked_device).stop_listen_notifications = AsyncMock()

@@ -3,6 +3,7 @@
   "name": "Sony Songpal",
   "codeowners": ["@rytilahti", "@shenxn"],
   "config_flow": true,
+  "dependencies": ["wake_on_lan"],
   "documentation": "https://www.home-assistant.io/integrations/songpal",
   "iot_class": "local_push",
   "loggers": ["songpal"],

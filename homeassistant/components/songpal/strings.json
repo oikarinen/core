@@ -11,12 +11,22 @@
         "description": "Do you want to set up {name} ({host})?"
       }
     },
-    "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
-    },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
       "not_songpal_device": "Not a Songpal device"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "turn_on_action": "Turn on action",
+          "wake_on_lan": "Wake on LAN"
+        }
+      }
     }
   },
   "services": {
