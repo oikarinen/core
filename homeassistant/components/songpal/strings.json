@@ -20,10 +20,12 @@
     }
   },
   "options": {
+    "flow_title": "{name} ({host}) options",
     "step": {
       "init": {
         "data": {
-          "turn_on_action": "Turn on action",
+          "name": "Name",
+          "turn_on_action": "Turn on action script",
           "wake_on_lan": "Wake on LAN"
         }
       }

@@ -29,7 +29,7 @@ def _urlparse(endpoint: str) -> ParseResult:
         parsed_url._replace(netloc=f"{parsed_url.path}:10000")
         parsed_url._replace(path="sony")
 
-    _LOGGER.debug("Parsed endpoint URL: %s", parsed_url.geturl())
+    _LOGGER.debug("Parsed endpoint URL: %s scheme %s", parsed_url.geturl(), parsed_url.scheme)
     return parsed_url
 
 
@@ -86,9 +86,6 @@ class SongpalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             await self.async_set_unique_id(self.endpoint)
             self._abort_if_unique_id_configured()
-
-        if user_input is None:
-            return self.async_abort(reason="not_supported")
 
         # Validate user form input
         errors = {}
@@ -182,19 +179,16 @@ class SongpalOptionsFlowHandler(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
+        errors = {}
+        all_scripts = self.hass.states.async_entity_ids("script")
         if user_input is not None:
             # Validate user form input
-            errors = {}
-
-            name = user_input[CONF_NAME]
-            on_action = user_input[CONF_ON_ACTION]
-            if (
-                on_action is not None
-                and on_action not in self.hass.states.async_entity_ids("script")
-            ):
+            name = user_input.get(CONF_NAME, "")
+            on_action = user_input.get(CONF_ON_ACTION, None)
+            if on_action is not None and on_action not in all_scripts:
                 errors[CONF_ON_ACTION] = "Script not found."
 
-            wol = bool(user_input[CONF_WOL])
+            wol = bool(user_input.get(CONF_WOL, False))
 
             if not errors:
                 return self.async_create_entry(
@@ -208,10 +202,8 @@ class SongpalOptionsFlowHandler(config_entries.OptionsFlow):
 
         options_schema = vol.Schema(
             {
-                vol.Required(CONF_NAME): str,
-                vol.Optional(CONF_ON_ACTION, default=None): vol.In(
-                    self.hass.states.async_entity_ids("script")
-                ),
+                vol.Optional(CONF_NAME): str,
+                vol.Optional(CONF_ON_ACTION, default=None): vol.Any(None, vol.In(all_scripts)),
                 vol.Optional(CONF_WOL, default=False): bool,
             }
         )
