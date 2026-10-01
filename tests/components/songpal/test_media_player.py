@@ -28,7 +28,9 @@ from homeassistant.components.wake_on_lan import (
     DOMAIN as WOL_DOMAIN,
     SERVICE_SEND_MAGIC_PACKET,
 )
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
+    CONF_MAC,
     EVENT_HOMEASSISTANT_STOP,
     STATE_OFF,
     STATE_ON,
@@ -505,27 +507,66 @@ async def test_error_swallowing(
             await _call(hass, service)
 
 
-async def test_turn_on_wake_on_lan(hass: HomeAssistant) -> None:
-    """Test turning on the device with wake-on-lan."""
-    mocked_device = _create_mocked_device()
-    entry = MockConfigEntry(
-        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
-    )
+async def _setup_entry(
+    hass: HomeAssistant,
+    mocked_device: MagicMock,
+    options: dict[str, Any] | None = None,
+) -> MockConfigEntry:
+    """Set up a config entry with the mocked device."""
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA, options=options)
     entry.add_to_hass(hass)
 
     with _patch_media_player_device(mocked_device):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+    return entry
+
+
+async def _setup_entry_offline(
+    hass: HomeAssistant,
+    mocked_device: MagicMock,
+    data: dict[str, Any],
+    options: dict[str, Any] | None = None,
+) -> tuple[MockConfigEntry, asyncio.Event]:
+    """Set up a config entry with the device unreachable until the event is set."""
+    online = asyncio.Event()
+    calls = 0
+
+    async def _get_supported_methods() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SongpalException("Unable to do POST request: ")
+        await online.wait()
+
+    type(mocked_device).get_supported_methods = AsyncMock(
+        side_effect=_get_supported_methods
+    )
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=data, options=options)
+    entry.add_to_hass(hass)
+
+    with (
+        _patch_media_player_device(mocked_device),
+        patch("homeassistant.components.songpal.media_player.INITIAL_RETRY_DELAY", 0),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry, online
+
+
+async def test_mac_stored(hass: HomeAssistant) -> None:
+    """Test the MAC address is stored once connected."""
+    entry = await _setup_entry(hass, _create_mocked_device())
+
+    assert entry.data == {**CONF_DATA, CONF_MAC: MAC}
+
+
+async def test_wake_on_lan_enabled(hass: HomeAssistant) -> None:
+    """Test wake-on-lan is enabled on the device when the option is set."""
+    mocked_device = _create_mocked_device()
+    await _setup_entry(hass, mocked_device, {CONF_WOL: True})
 
     mocked_device.set_power_settings.assert_called_once_with("wolMode", "on")
-
-    calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
-    await _call(hass, media_player.SERVICE_TURN_ON)
-    await hass.async_block_till_done()
-
-    assert len(calls) == 1
-    assert calls[0].data == {"mac": MAC, "broadcast_address": HOST}
-    mocked_device.set_power.assert_not_called()
 
 
 async def test_wake_on_lan_not_supported(
@@ -536,53 +577,129 @@ async def test_wake_on_lan_not_supported(
     type(mocked_device).set_power_settings = AsyncMock(
         side_effect=SongpalException("not supported")
     )
-    entry = MockConfigEntry(
-        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
-    )
-    entry.add_to_hass(hass)
-
-    with _patch_media_player_device(mocked_device):
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    await _setup_entry(hass, mocked_device, {CONF_WOL: True})
 
     assert hass.states.get(ENTITY_ID).state == STATE_ON
     assert "Unable to enable wake-on-lan" in caplog.text
 
 
-async def test_turn_on_action(hass: HomeAssistant) -> None:
-    """Test turning on the device with a script."""
+async def test_turn_on_connected_with_turn_on_options(hass: HomeAssistant) -> None:
+    """Test turning on a reachable device uses the API even with the options."""
     mocked_device = _create_mocked_device()
-    entry = MockConfigEntry(
-        domain=songpal.DOMAIN,
-        data=CONF_DATA,
-        options={CONF_ON_ACTION: "script.turn_on_soundbar", CONF_WOL: False},
+    await _setup_entry(
+        hass,
+        mocked_device,
+        {CONF_ON_ACTION: "script.turn_on_soundbar", CONF_WOL: True},
     )
+    wol_calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
+    script_calls = async_mock_service(hass, "script", "turn_on_soundbar")
+
+    await _call(hass, media_player.SERVICE_TURN_ON)
+    await hass.async_block_till_done()
+
+    mocked_device.set_power.assert_called_once_with(True)
+    assert not wol_calls
+    assert not script_calls
+
+
+@pytest.mark.parametrize(
+    ("options", "wol_packets", "script_runs"),
+    [
+        ({CONF_WOL: True}, 2, 0),
+        ({CONF_ON_ACTION: "script.turn_on_soundbar"}, 0, 1),
+        ({CONF_ON_ACTION: "script.turn_on_soundbar", CONF_WOL: True}, 2, 1),
+    ],
+)
+async def test_turn_on_disconnected(
+    hass: HomeAssistant,
+    options: dict[str, Any],
+    wol_packets: int,
+    script_runs: int,
+) -> None:
+    """Test turning on an unreachable device with wake-on-lan and the script."""
+    mocked_device = _create_mocked_device()
+    await _setup_entry_offline(
+        hass, mocked_device, {**CONF_DATA, CONF_MAC: MAC}, options
+    )
+    wol_calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
+    script_calls = async_mock_service(hass, "script", "turn_on_soundbar")
+
+    await _call(hass, media_player.SERVICE_TURN_ON)
+    await hass.async_block_till_done()
+
+    assert [call.data for call in wol_calls] == [
+        {"mac": MAC},
+        {"mac": MAC, "broadcast_address": HOST},
+    ][:wol_packets]
+    assert len(script_calls) == script_runs
+    mocked_device.set_power.assert_not_called()
+
+
+async def test_setup_offline(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test setting up while the device is off, and it coming online later."""
+    mocked_device = _create_mocked_device()
+    entry, online = await _setup_entry_offline(
+        hass, mocked_device, {**CONF_DATA, CONF_MAC: MAC}, {CONF_WOL: True}
+    )
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert hass.states.get(ENTITY_ID).state == STATE_OFF
+    assert entity_registry.async_get(ENTITY_ID).unique_id == MAC
+    assert "Unable to connect, assuming the device is off" in caplog.text
+
+    # Updating does not touch the device before it has been reached
+    await async_setup_component(hass, "homeassistant", {})
+    await hass.services.async_call(
+        "homeassistant", "update_entity", {"entity_id": ENTITY_ID}, blocking=True
+    )
+    assert hass.states.get(ENTITY_ID).state == STATE_OFF
+    mocked_device.get_system_info.assert_not_called()
+    mocked_device.listen_notifications.assert_not_called()
+
+    online.set()
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_ON
+    mocked_device.set_power_settings.assert_called_once_with("wolMode", "on")
+    mocked_device.listen_notifications.assert_called_once()
+    assert "Connection reestablished" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("data", "options"),
+    [
+        (CONF_DATA, {CONF_WOL: True}),
+        ({**CONF_DATA, CONF_MAC: MAC}, None),
+    ],
+)
+async def test_setup_offline_not_ready(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    data: dict[str, Any],
+    options: dict[str, Any] | None,
+) -> None:
+    """Test setup is retried when the device cannot be set up as off."""
+    mocked_device = _create_mocked_device(throw_exception=True)
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=data, options=options)
     entry.add_to_hass(hass)
 
     with _patch_media_player_device(mocked_device):
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
-    calls = async_mock_service(hass, "script", "turn_on_soundbar")
-    await _call(hass, media_player.SERVICE_TURN_ON)
-    await hass.async_block_till_done()
-
-    assert len(calls) == 1
-    mocked_device.set_power.assert_not_called()
-    mocked_device.set_power_settings.assert_not_called()
+    assert hass.states.get(ENTITY_ID) is None
+    assert "Platform songpal not ready yet" in caplog.text
+    assert "assuming the device is off" not in caplog.text
 
 
 async def test_disconnected_with_turn_on_option(hass: HomeAssistant) -> None:
     """Test the entity stays available and off while disconnected."""
     mocked_device = _create_mocked_device()
-    entry = MockConfigEntry(
-        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
-    )
-    entry.add_to_hass(hass)
-
-    with _patch_media_player_device(mocked_device):
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    await _setup_entry(hass, mocked_device, {CONF_WOL: True})
 
     assert hass.states.get(ENTITY_ID).state == STATE_ON
 
@@ -631,12 +748,7 @@ async def _reconnect_with_failures(
 async def test_reconnect_backoff(hass: HomeAssistant) -> None:
     """Test the reconnect delay doubles after each failure."""
     mocked_device = _create_mocked_device()
-    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
-    entry.add_to_hass(hass)
-
-    with _patch_media_player_device(mocked_device):
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    await _setup_entry(hass, mocked_device)
 
     sleeps = await _reconnect_with_failures(hass, mocked_device, 2)
 
@@ -647,14 +759,7 @@ async def test_reconnect_backoff(hass: HomeAssistant) -> None:
 async def test_reconnect_after_turn_on(hass: HomeAssistant) -> None:
     """Test turning the device on cuts the reconnect delay short."""
     mocked_device = _create_mocked_device()
-    entry = MockConfigEntry(
-        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
-    )
-    entry.add_to_hass(hass)
-
-    with _patch_media_player_device(mocked_device):
-        await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+    await _setup_entry(hass, mocked_device, {CONF_WOL: True})
 
     calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
 
@@ -668,4 +773,4 @@ async def test_reconnect_after_turn_on(hass: HomeAssistant) -> None:
 
     # 10, then 10 of the 20 seconds until turned on, then 20 seconds
     assert sleeps == [10] * 4
-    assert len(calls) == 1
+    assert len(calls) == 2

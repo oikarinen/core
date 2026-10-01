@@ -189,6 +189,30 @@ async def test_flow_import(hass: HomeAssistant) -> None:
     mocked_device.get_interface_information.assert_not_called()
 
 
+async def test_flow_import_with_options(hass: HomeAssistant) -> None:
+    """Test import flow storing the options given in YAML."""
+    mocked_device = _create_mocked_device()
+
+    with _patch_config_flow_device(mocked_device), _patch_setup():
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data={
+                **CONF_DATA,
+                CONF_ON_ACTION: "script.turn_on_soundbar",
+                CONF_WOL: True,
+            },
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert result["data"] == CONF_DATA
+
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    assert entry.options == {
+        CONF_ON_ACTION: "script.turn_on_soundbar",
+        CONF_WOL: True,
+    }
+
+
 async def test_flow_import_without_name(hass: HomeAssistant) -> None:
     """Test import flow without optional name."""
     mocked_device = _create_mocked_device()

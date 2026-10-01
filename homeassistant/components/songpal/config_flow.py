@@ -127,9 +127,19 @@ class SongpalConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(endpoint)
         self._abort_if_unique_id_configured()
 
+        options = {}
+        if self.source == SOURCE_IMPORT:
+            # The options can also be given in the YAML configuration
+            options = {
+                key: user_input[key]
+                for key in (CONF_ON_ACTION, CONF_WOL)
+                if key in user_input
+            }
+
         return self.async_create_entry(
             title=name,
             data={CONF_NAME: name, CONF_ENDPOINT: endpoint},
+            options=options,
         )
 
     @override
