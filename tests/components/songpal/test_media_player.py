@@ -20,6 +20,8 @@ from homeassistant.components.media_player import MediaPlayerEntityFeature
 from homeassistant.components.songpal.const import ERROR_REQUEST_RETRY
 from homeassistant.components.songpal.services import SET_SOUND_SETTING
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    CONF_MAC,
     EVENT_HOMEASSISTANT_STOP,
     STATE_OFF,
     STATE_ON,
@@ -493,3 +495,75 @@ async def test_error_swallowing(
     else:
         with pytest.raises(SongpalException):
             await _call(hass, service)
+
+
+async def test_mac_stored(hass: HomeAssistant) -> None:
+    """Test the MAC address is stored, to set up the device while it is off."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.data == {**CONF_DATA, CONF_MAC: MAC}
+
+
+async def test_setup_unreachable(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test setting up a known device that cannot be reached."""
+    mocked_device = _create_mocked_device(throw_exception=True)
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data={**CONF_DATA, CONF_MAC: MAC})
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+    assert entity_registry.async_get(ENTITY_ID).unique_id == MAC
+    assert device_registry.async_get_device_by_identifier(
+        (songpal.DOMAIN, MAC), entry.entry_id
+    )
+    assert "Unable to connect, the device might be off" in caplog.text
+
+    # Updating does not use the device before it has been reached
+    await async_setup_component(hass, "homeassistant", {})
+    await hass.services.async_call(
+        "homeassistant", "update_entity", {ATTR_ENTITY_ID: ENTITY_ID}, blocking=True
+    )
+    mocked_device.get_system_info.assert_not_called()
+
+    type(mocked_device).get_supported_methods = AsyncMock()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_ON
+    mocked_device.listen_notifications.assert_called_once()
+
+
+async def test_no_mac(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test a device that does not report a MAC address."""
+    mocked_device = _create_mocked_device(wired_mac=None, wireless_mac=None)
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    # Without a unique ID the entity is not registered, and has no device
+    states = hass.states.async_all(media_player.DOMAIN)
+    assert [state.state for state in states] == [STATE_ON]
+    assert entity_registry.async_get(states[0].entity_id) is None
+    assert not dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+    assert entry.data == CONF_DATA

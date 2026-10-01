@@ -12,6 +12,7 @@ from homeassistant.components.device_automation import DeviceAutomationType
 from homeassistant.components.songpal.const import DOMAIN
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    CONF_MAC,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
     STATE_OFF,
@@ -207,3 +208,32 @@ async def test_unreachable_without_trigger(
     await _wait(hass, 11)
     await reconnect
     assert hass.states.get(ENTITY_ID).state == STATE_ON
+
+
+async def test_turn_on_unreachable_at_startup(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    service_calls: list[ServiceCall],
+) -> None:
+    """Test the trigger turns on a device that was unreachable during setup."""
+    mocked_device = _create_mocked_device(throw_exception=True)
+    entry = MockConfigEntry(domain=DOMAIN, data={**CONF_DATA, CONF_MAC: MAC})
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    device = device_registry.async_get_device_by_identifier(
+        (DOMAIN, MAC), entry.entry_id
+    )
+    assert device is not None
+    await _setup_turn_on_automation(hass, device.id)
+    assert hass.states.get(ENTITY_ID).state == STATE_OFF
+
+    await _turn_on(hass)
+
+    mocked_device.set_power.assert_not_called()
+    assert len(service_calls) == 2
+    assert service_calls[1].domain == "test"
+    assert service_calls[1].data["some"] == device.id

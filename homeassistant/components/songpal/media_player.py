@@ -23,7 +23,7 @@ from homeassistant.components.media_player import (
     MediaPlayerState,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import CONF_MAC, CONF_NAME, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers import device_registry as dr
@@ -67,20 +67,35 @@ async def async_setup_entry(
     """Set up songpal media player."""
     name = config_entry.data[CONF_NAME]
     endpoint = config_entry.data[CONF_ENDPOINT]
+    mac = config_entry.data.get(CONF_MAC)
 
     device = Device(endpoint)
+    sysinfo = None
     try:
         async with asyncio.timeout(
             10
         ):  # set timeout to avoid blocking the setup process
             await device.get_supported_methods()
+            sysinfo = await device.get_system_info()
     except (SongpalException, TimeoutError) as ex:
-        _LOGGER.warning("[%s(%s)] Unable to connect", name, endpoint)
         _LOGGER.debug("Unable to get methods from songpal: %s", ex)
-        raise PlatformNotReady from ex
+        if mac is None:
+            _LOGGER.warning("[%s(%s)] Unable to connect", name, endpoint)
+            raise PlatformNotReady from ex
+        # The device has been connected before, so it can be set up while it is
+        # off, and connected to once it is turned on
+        _LOGGER.warning(
+            "[%s(%s)] Unable to connect, the device might be off", name, endpoint
+        )
+    else:
+        mac = sysinfo.macAddr or sysinfo.wirelessMacAddr
+        if mac and mac != config_entry.data.get(CONF_MAC):
+            hass.config_entries.async_update_entry(
+                config_entry, data={**config_entry.data, CONF_MAC: mac}
+            )
 
-    songpal_entity = SongpalEntity(name, device)
-    async_add_entities([songpal_entity], True)
+    songpal_entity = SongpalEntity(name, device, mac, sysinfo)
+    async_add_entities([songpal_entity], sysinfo is not None)
 
 
 class SongpalEntity(MediaPlayerEntity):
@@ -100,12 +115,15 @@ class SongpalEntity(MediaPlayerEntity):
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, name, device):
+    def __init__(self, name, device, mac, sysinfo):
         """Init."""
         self._name = name
         self._dev = device
-        self._sysinfo = None
+        self._sysinfo = sysinfo
         self._model = None
+        self._attr_unique_id = mac
+        # The device cannot be used before its supported methods are fetched
+        self._methods_loaded = sysinfo is not None
 
         self._state = False
         self._attr_available = False
@@ -219,39 +237,7 @@ class SongpalEntity(MediaPlayerEntity):
             self._attr_available = False
             self.async_write_ha_state()
 
-            # Try to reconnect forever, a successful reconnect will initialize
-            # the websocket connection again.
-            self._retry_delay = INITIAL_RETRY_DELAY
-            while not self._attr_available:
-                _LOGGER.debug("Trying to reconnect in %s seconds", self._retry_delay)
-                self._retry_now.clear()
-                try:
-                    async with asyncio.timeout(self._retry_delay):
-                        await self._retry_now.wait()
-                except TimeoutError:
-                    pass
-                else:
-                    # The device was requested to turn on, which reset the delay
-                    continue
-
-                try:
-                    await self._dev.get_supported_methods()
-                except SongpalException as ex:
-                    _LOGGER.debug("Failed to reconnect: %s", ex)
-                    self._retry_delay = min(2 * self._retry_delay, 300)
-                else:
-                    # We need to inform HA about the state in case we are coming
-                    # back from a disconnected state.
-                    await self.async_update_ha_state(force_refresh=True)
-
-            entry.async_create_background_task(
-                self.hass,
-                self._dev.listen_notifications(),
-                "songpal-listen-notifications",
-            )
-            _LOGGER.warning(
-                "[%s(%s)] Connection reestablished", self.name, self._dev.endpoint
-            )
+            await self._async_reconnect(entry)
 
         self._dev.on_notification(VolumeChange, _volume_changed)
         self._dev.on_notification(ContentChange, _source_changed)
@@ -266,20 +252,70 @@ class SongpalEntity(MediaPlayerEntity):
             self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, handle_stop)
         )
 
+        if not self._methods_loaded:
+            # The device could not be reached during setup
+            entry.async_create_background_task(
+                self.hass, self._async_reconnect(entry), "songpal-reconnect"
+            )
+            return
+
         entry.async_create_background_task(
             self.hass, self._dev.listen_notifications(), "songpal-listen-notifications"
         )
 
-    @property
-    @override
-    def unique_id(self):
-        """Return a unique ID."""
-        return self._sysinfo.macAddr or self._sysinfo.wirelessMacAddr
+    async def _async_reconnect(self, entry: ConfigEntry) -> None:
+        """Try to reconnect forever.
+
+        A successful reconnect will initialize the websocket connection again.
+        """
+        self._retry_delay = INITIAL_RETRY_DELAY
+        while not self._attr_available:
+            _LOGGER.debug("Trying to reconnect in %s seconds", self._retry_delay)
+            self._retry_now.clear()
+            try:
+                async with asyncio.timeout(self._retry_delay):
+                    await self._retry_now.wait()
+            except TimeoutError:
+                pass
+            else:
+                # The device was requested to turn on, which reset the delay
+                continue
+
+            try:
+                await self._dev.get_supported_methods()
+            except SongpalException as ex:
+                _LOGGER.debug("Failed to reconnect: %s", ex)
+                self._retry_delay = min(2 * self._retry_delay, 300)
+            else:
+                self._methods_loaded = True
+                # We need to inform HA about the state in case we are coming
+                # back from a disconnected state.
+                await self.async_update_ha_state(force_refresh=True)
+
+        entry.async_create_background_task(
+            self.hass,
+            self._dev.listen_notifications(),
+            "songpal-listen-notifications",
+        )
+        _LOGGER.warning(
+            "[%s(%s)] Connection reestablished", self.name, self._dev.endpoint
+        )
 
     @property
     @override
-    def device_info(self) -> DeviceInfo:
+    def device_info(self) -> DeviceInfo | None:
         """Return the device info."""
+        if (mac := self.unique_id) is None:
+            return None
+        if self._sysinfo is None:
+            # The device has not been reached, the device registry keeps the
+            # rest of the info from when it was
+            return DeviceInfo(
+                connections={(dr.CONNECTION_NETWORK_MAC, mac)},
+                identifiers={(DOMAIN, mac)},
+                manufacturer="Sony Corporation",
+                name=self._name,
+            )
         connections = set()
         if self._sysinfo.macAddr:
             connections.add((dr.CONNECTION_NETWORK_MAC, self._sysinfo.macAddr))
@@ -287,7 +323,7 @@ class SongpalEntity(MediaPlayerEntity):
             connections.add((dr.CONNECTION_NETWORK_MAC, self._sysinfo.wirelessMacAddr))
         return DeviceInfo(
             connections=connections,
-            identifiers={(DOMAIN, self.unique_id)},
+            identifiers={(DOMAIN, mac)},
             manufacturer="Sony Corporation",
             model=self._model,
             name=self._name,
@@ -311,6 +347,9 @@ class SongpalEntity(MediaPlayerEntity):
 
     async def async_update(self) -> None:
         """Fetch updates from the device."""
+        if not self._methods_loaded:
+            # The device has not been reached yet, see _async_reconnect
+            return
         try:
             if self._sysinfo is None:
                 self._sysinfo = await self._dev.get_system_info()
