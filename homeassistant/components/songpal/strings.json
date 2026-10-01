@@ -19,6 +19,11 @@
       }
     }
   },
+  "device_automation": {
+    "trigger_type": {
+      "turn_on": "Device is requested to turn on"
+    }
+  },
   "services": {
     "set_sound_setting": {
       "description": "Change sound setting.",

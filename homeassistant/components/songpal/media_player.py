@@ -32,9 +32,11 @@ from homeassistant.helpers.entity_platform import (
     AddConfigEntryEntitiesCallback,
     AddEntitiesCallback,
 )
+from homeassistant.helpers.trigger import PluggableAction
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from .const import CONF_ENDPOINT, DOMAIN, ERROR_REQUEST_RETRY
+from .helpers import async_get_turn_on_trigger
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,6 +110,9 @@ class SongpalEntity(MediaPlayerEntity):
         self._state = False
         self._attr_available = False
         self._initialized = False
+        self._turn_on = PluggableAction(self.async_write_ha_state)
+        self._retry_delay = INITIAL_RETRY_DELAY
+        self._retry_now = asyncio.Event()
 
         self._volume_control = None
         self._volume_min = 0
@@ -123,6 +128,12 @@ class SongpalEntity(MediaPlayerEntity):
     @override
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
+        if (entry := self.registry_entry) and entry.device_id:
+            self.async_on_remove(
+                self._turn_on.async_register(
+                    self.hass, async_get_turn_on_trigger(entry.device_id)
+                )
+            )
         await self.async_activate_websocket()
 
     @override
@@ -203,21 +214,31 @@ class SongpalEntity(MediaPlayerEntity):
                 self._dev.endpoint,
             )
             _LOGGER.debug("Disconnected: %s", connect.exception)
+            # The device is shown as off when it can be turned on by a trigger
+            self._state = False
             self._attr_available = False
             self.async_write_ha_state()
 
             # Try to reconnect forever, a successful reconnect will initialize
             # the websocket connection again.
-            delay = INITIAL_RETRY_DELAY
+            self._retry_delay = INITIAL_RETRY_DELAY
             while not self._attr_available:
-                _LOGGER.debug("Trying to reconnect in %s seconds", delay)
-                await asyncio.sleep(delay)
+                _LOGGER.debug("Trying to reconnect in %s seconds", self._retry_delay)
+                self._retry_now.clear()
+                try:
+                    async with asyncio.timeout(self._retry_delay):
+                        await self._retry_now.wait()
+                except TimeoutError:
+                    pass
+                else:
+                    # The device was requested to turn on, which reset the delay
+                    continue
 
                 try:
                     await self._dev.get_supported_methods()
                 except SongpalException as ex:
                     _LOGGER.debug("Failed to reconnect: %s", ex)
-                    delay = min(2 * delay, 300)
+                    self._retry_delay = min(2 * self._retry_delay, 300)
                 else:
                     # We need to inform HA about the state in case we are coming
                     # back from a disconnected state.
@@ -272,6 +293,16 @@ class SongpalEntity(MediaPlayerEntity):
             name=self._name,
             sw_version=self._sysinfo.version,
         )
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if the entity is available.
+
+        When the device cannot be reached, it is shown as off instead if it can
+        be turned on by a trigger.
+        """
+        return super().available or bool(self._turn_on)
 
     async def async_set_sound_setting(self, name, value):
         """Change a setting on the device."""
@@ -412,6 +443,12 @@ class SongpalEntity(MediaPlayerEntity):
     @override
     async def async_turn_on(self) -> None:
         """Turn the device on."""
+        if not self._attr_available and self._turn_on:
+            await self._turn_on.async_run(self.hass, self._context)
+            # Try to reconnect sooner, as the device should be coming up
+            self._retry_delay = INITIAL_RETRY_DELAY
+            self._retry_now.set()
+            return
         try:
             await self._dev.set_power(True)
         except SongpalException as ex:
@@ -425,6 +462,9 @@ class SongpalEntity(MediaPlayerEntity):
     @override
     async def async_turn_off(self) -> None:
         """Turn the device off."""
+        if not self._attr_available:
+            # The device cannot be reached, it is shown as off already
+            return
         try:
             await self._dev.set_power(False)
         except SongpalException as ex:
