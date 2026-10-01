@@ -4,6 +4,8 @@ import copy
 import dataclasses
 from unittest.mock import patch
 
+import pytest
+
 from homeassistant.components.songpal.const import CONF_ENDPOINT, DOMAIN
 from homeassistant.config_entries import (
     SOURCE_IMPORT,
@@ -118,6 +120,61 @@ async def test_flow_user(hass: HomeAssistant) -> None:
 
     mocked_device.get_supported_methods.assert_called_once()
     mocked_device.get_interface_information.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("user_endpoint", "endpoint"),
+    [
+        (HOST, ENDPOINT),
+        (f"{HOST}:10000", ENDPOINT),
+        (f"{HOST}:10001", f"http://{HOST}:10001/sony"),
+    ],
+)
+async def test_flow_user_host(
+    hass: HomeAssistant, user_endpoint: str, endpoint: str
+) -> None:
+    """Test user initialized flow with just the host given."""
+    mocked_device = _create_mocked_device()
+
+    with (
+        _patch_config_flow_device(mocked_device) as device_class,
+        _patch_setup(),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_USER},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_ENDPOINT: user_endpoint},
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert result["data"] == {
+            CONF_NAME: MODEL,
+            CONF_ENDPOINT: endpoint,
+        }
+
+    device_class.assert_called_once_with(endpoint)
+
+
+async def test_flow_user_invalid_host(hass: HomeAssistant) -> None:
+    """Test user initialized flow with an invalid host."""
+    mocked_device = _create_mocked_device()
+
+    with _patch_config_flow_device(mocked_device) as device_class:
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_USER},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_ENDPOINT: ":10000"},
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "user"
+        assert result["errors"] == {"base": "invalid_host"}
+
+    device_class.assert_not_called()
 
 
 async def test_flow_import(hass: HomeAssistant) -> None:
