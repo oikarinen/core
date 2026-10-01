@@ -6,9 +6,11 @@ from urllib.parse import urlparse
 
 import probatio
 from songpal import Device, SongpalException
+from yarl import URL
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_NAME
+from homeassistant.core import callback
 from homeassistant.helpers.service_info.ssdp import (
     ATTR_UPNP_FRIENDLY_NAME,
     ATTR_UPNP_UDN,
@@ -18,6 +20,24 @@ from homeassistant.helpers.service_info.ssdp import (
 from .const import CONF_ENDPOINT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+DEFAULT_PORT = 10000
+DEFAULT_PATH = "/sony"
+
+
+def _get_endpoint(value: str) -> str:
+    """Return the endpoint URL for the user input.
+
+    Instead of the URL, just the host of the device can be given, optionally
+    with the port. Raises ValueError if the host is not valid.
+    """
+    if "://" in value:
+        return value
+    url = URL(f"http://{value}")
+    url = url.with_port(url.explicit_port or DEFAULT_PORT)
+    if url.path in ("", "/"):
+        url = url.with_path(DEFAULT_PATH)
+    return str(url)
 
 
 class SongpalConfig:
@@ -51,7 +71,10 @@ class SongpalConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         # Validate input
-        endpoint = user_input[CONF_ENDPOINT]
+        try:
+            endpoint = _get_endpoint(user_input[CONF_ENDPOINT])
+        except ValueError:
+            return self._async_show_user_form_error(user_input, "invalid_host")
         parsed_url = urlparse(endpoint)
 
         # Try to connect and get device name
@@ -62,21 +85,28 @@ class SongpalConfigFlow(ConfigFlow, domain=DOMAIN):
             name = interface_info.modelName
         except SongpalException as ex:
             _LOGGER.debug("Connection failed: %s", ex)
-            return self.async_show_form(
-                step_id="user",
-                data_schema=probatio.Schema(
-                    {
-                        probatio.Required(
-                            CONF_ENDPOINT, default=user_input.get(CONF_ENDPOINT, "")
-                        ): str,
-                    }
-                ),
-                errors={"base": "cannot_connect"},
-            )
+            return self._async_show_user_form_error(user_input, "cannot_connect")
 
         self.conf = SongpalConfig(name, parsed_url.hostname, endpoint)
 
         return await self.async_step_init(user_input)
+
+    @callback
+    def _async_show_user_form_error(
+        self, user_input: dict[str, str], error: str
+    ) -> ConfigFlowResult:
+        """Show the user form again with an error."""
+        return self.async_show_form(
+            step_id="user",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_ENDPOINT, default=user_input.get(CONF_ENDPOINT, "")
+                    ): str,
+                }
+            ),
+            errors={"base": error},
+        )
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

@@ -5,7 +5,8 @@
       "not_songpal_device": "Not a Songpal device"
     },
     "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_host": "[%key:common::config_flow::error::invalid_host%]"
     },
     "flow_title": "{name} ({host})",
     "step": {
@@ -15,6 +16,9 @@
       "user": {
         "data": {
           "endpoint": "Endpoint"
+        },
+        "data_description": {
+          "endpoint": "The URL of the API of the device, such as `http://192.168.1.10:10000/sony`, or just the hostname or IP address of the device."
         }
       }
     }
