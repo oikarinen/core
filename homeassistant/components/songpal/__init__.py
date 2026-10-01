@@ -8,13 +8,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_ENDPOINT, DOMAIN
+from .const import CONF_ENDPOINT, CONF_ON_ACTION, CONF_WOL, DOMAIN
 from .services import async_setup_services
 
 SONGPAL_CONFIG_SCHEMA = probatio.Schema(
     {
-        probatio.Optional(CONF_NAME): cv.string,
         probatio.Required(CONF_ENDPOINT): cv.string,
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_ON_ACTION): cv.service,
+        probatio.Optional(CONF_WOL): cv.boolean,
     }
 )
 

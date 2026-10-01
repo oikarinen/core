@@ -2,6 +2,7 @@
   "config": {
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "not_songpal_device": "Not a Songpal device"
     },
     "error": {
@@ -15,6 +16,19 @@
       "user": {
         "data": {
           "endpoint": "Endpoint"
+        }
+      }
+    }
+  },
+  "options": {
+    "error": {
+      "script_not_found": "Script not found."
+    },
+    "step": {
+      "init": {
+        "data": {
+          "turn_on_action": "Turn on action script",
+          "wake_on_lan": "Wake on LAN"
         }
       }
     }

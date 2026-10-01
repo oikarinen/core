@@ -27,6 +27,7 @@ def _create_mocked_device(
     throw_exception=False, wired_mac=MAC, wireless_mac=None, no_soundfield=False
 ):
     mocked_device = MagicMock()
+    mocked_device.endpoint = ENDPOINT
 
     type(mocked_device).get_supported_methods = AsyncMock(
         side_effect=SongpalException("Unable to do POST request: ")
@@ -113,6 +114,7 @@ def _create_mocked_device(
     )
 
     type(mocked_device).set_power = AsyncMock()
+    type(mocked_device).set_power_settings = AsyncMock()
     type(mocked_device).set_sound_settings = AsyncMock()
     type(mocked_device).listen_notifications = AsyncMock()
     type(mocked_device).stop_listen_notifications = AsyncMock()

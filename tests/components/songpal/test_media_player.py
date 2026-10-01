@@ -1,5 +1,6 @@
 """Test songpal media_player."""
 
+import asyncio
 from datetime import timedelta
 import logging
 from typing import Any
@@ -17,8 +18,16 @@ from songpal.notification import SettingChange
 
 from homeassistant.components import media_player, songpal
 from homeassistant.components.media_player import MediaPlayerEntityFeature
-from homeassistant.components.songpal.const import ERROR_REQUEST_RETRY
+from homeassistant.components.songpal.const import (
+    CONF_ON_ACTION,
+    CONF_WOL,
+    ERROR_REQUEST_RETRY,
+)
 from homeassistant.components.songpal.services import SET_SOUND_SETTING
+from homeassistant.components.wake_on_lan import (
+    DOMAIN as WOL_DOMAIN,
+    SERVICE_SEND_MAGIC_PACKET,
+)
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
     STATE_OFF,
@@ -37,6 +46,7 @@ from . import (
     ENDPOINT,
     ENTITY_ID,
     FRIENDLY_NAME,
+    HOST,
     MAC,
     MODEL,
     SW_VERSION,
@@ -45,7 +55,7 @@ from . import (
     _patch_media_player_device,
 )
 
-from tests.common import MockConfigEntry, async_fire_time_changed
+from tests.common import MockConfigEntry, async_fire_time_changed, async_mock_service
 
 SUPPORT_SONGPAL = (
     MediaPlayerEntityFeature.VOLUME_SET
@@ -493,3 +503,169 @@ async def test_error_swallowing(
     else:
         with pytest.raises(SongpalException):
             await _call(hass, service)
+
+
+async def test_turn_on_wake_on_lan(hass: HomeAssistant) -> None:
+    """Test turning on the device with wake-on-lan."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(
+        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    mocked_device.set_power_settings.assert_called_once_with("wolMode", "on")
+
+    calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
+    await _call(hass, media_player.SERVICE_TURN_ON)
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert calls[0].data == {"mac": MAC, "broadcast_address": HOST}
+    mocked_device.set_power.assert_not_called()
+
+
+async def test_wake_on_lan_not_supported(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test setup when enabling wake-on-lan on the device fails."""
+    mocked_device = _create_mocked_device()
+    type(mocked_device).set_power_settings = AsyncMock(
+        side_effect=SongpalException("not supported")
+    )
+    entry = MockConfigEntry(
+        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_ON
+    assert "Unable to enable wake-on-lan" in caplog.text
+
+
+async def test_turn_on_action(hass: HomeAssistant) -> None:
+    """Test turning on the device with a script."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(
+        domain=songpal.DOMAIN,
+        data=CONF_DATA,
+        options={CONF_ON_ACTION: "script.turn_on_soundbar", CONF_WOL: False},
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    calls = async_mock_service(hass, "script", "turn_on_soundbar")
+    await _call(hass, media_player.SERVICE_TURN_ON)
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    mocked_device.set_power.assert_not_called()
+    mocked_device.set_power_settings.assert_not_called()
+
+
+async def test_disconnected_with_turn_on_option(hass: HomeAssistant) -> None:
+    """Test the entity stays available and off while disconnected."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(
+        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_ON
+
+    states = []
+
+    async def _get_supported_methods():
+        states.append(hass.states.get(ENTITY_ID).state)
+        if len(states) == 1:
+            raise SongpalException("")
+
+    type(mocked_device).get_supported_methods = AsyncMock(
+        side_effect=_get_supported_methods
+    )
+    connect_change = MagicMock()
+    connect_change.exception = "disconnected"
+    with patch("homeassistant.components.songpal.media_player.INITIAL_RETRY_DELAY", 0):
+        await mocked_device.notification_callbacks[ConnectChange](connect_change)
+
+    assert states == [STATE_OFF, STATE_OFF]
+    assert hass.states.get(ENTITY_ID).state == STATE_ON
+
+
+async def _reconnect_with_failures(
+    hass: HomeAssistant, mocked_device: MagicMock, failures: int, on_sleep=None
+) -> list[float]:
+    """Disconnect the device and record the sleeps until it reconnects."""
+    real_sleep = asyncio.sleep
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if on_sleep is not None:
+            await on_sleep(len(sleeps))
+        await real_sleep(0)
+
+    type(mocked_device).get_supported_methods = AsyncMock(
+        side_effect=[SongpalException("")] * failures + [None]
+    )
+    connect_change = MagicMock()
+    connect_change.exception = "disconnected"
+    with patch("homeassistant.components.songpal.media_player.asyncio.sleep", _sleep):
+        await mocked_device.notification_callbacks[ConnectChange](connect_change)
+    return sleeps
+
+
+async def test_reconnect_backoff(hass: HomeAssistant) -> None:
+    """Test the reconnect delay doubles after each failure."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    sleeps = await _reconnect_with_failures(hass, mocked_device, 2)
+
+    # 10 + 20 + 40 seconds, slept in 10 second steps
+    assert sleeps == [10] * 7
+
+
+async def test_reconnect_after_turn_on(hass: HomeAssistant) -> None:
+    """Test turning the device on cuts the reconnect delay short."""
+    mocked_device = _create_mocked_device()
+    entry = MockConfigEntry(
+        domain=songpal.DOMAIN, data=CONF_DATA, options={CONF_WOL: True}
+    )
+    entry.add_to_hass(hass)
+
+    with _patch_media_player_device(mocked_device):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    calls = async_mock_service(hass, WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET)
+
+    async def _on_sleep(count: int) -> None:
+        # Turn the device on during the first step of the 20 second wait
+        if count == 2:
+            await _call(hass, media_player.SERVICE_TURN_ON)
+
+    sleeps = await _reconnect_with_failures(hass, mocked_device, 2, _on_sleep)
+    await hass.async_block_till_done()
+
+    # 10, then 10 of the 20 seconds until turned on, then 20 seconds
+    assert sleeps == [10] * 4
+    assert len(calls) == 1

@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 import logging
 from typing import override
+from urllib.parse import urlparse
 
 from songpal import (
     ConnectChange,
@@ -22,8 +23,17 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
+from homeassistant.components.wake_on_lan import (
+    DOMAIN as WOL_DOMAIN,
+    SERVICE_SEND_MAGIC_PACKET,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import (
+    CONF_BROADCAST_ADDRESS,
+    CONF_MAC,
+    CONF_NAME,
+    EVENT_HOMEASSISTANT_STOP,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers import device_registry as dr
@@ -34,7 +44,7 @@ from homeassistant.helpers.entity_platform import (
 )
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import CONF_ENDPOINT, DOMAIN, ERROR_REQUEST_RETRY
+from .const import CONF_ENDPOINT, CONF_ON_ACTION, CONF_WOL, DOMAIN, ERROR_REQUEST_RETRY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +75,8 @@ async def async_setup_entry(
     """Set up songpal media player."""
     name = config_entry.data[CONF_NAME]
     endpoint = config_entry.data[CONF_ENDPOINT]
+    on_action = config_entry.options.get(CONF_ON_ACTION)
+    wol = config_entry.options.get(CONF_WOL, False)
 
     device = Device(endpoint)
     try:
@@ -77,7 +89,16 @@ async def async_setup_entry(
         _LOGGER.debug("Unable to get methods from songpal: %s", ex)
         raise PlatformNotReady from ex
 
-    songpal_entity = SongpalEntity(name, device)
+    if wol:
+        _LOGGER.debug("Enabling wake-on-lan for songpal device: %s", name)
+        try:
+            await device.set_power_settings("wolMode", "on")
+        except SongpalException as ex:
+            _LOGGER.warning(
+                "[%s(%s)] Unable to enable wake-on-lan: %s", name, endpoint, ex
+            )
+
+    songpal_entity = SongpalEntity(name, device, on_action, wol)
     async_add_entities([songpal_entity], True)
 
 
@@ -98,16 +119,19 @@ class SongpalEntity(MediaPlayerEntity):
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, name, device):
-        """Init."""
+    def __init__(self, name, device, on_action=None, wol=False):
+        """Initialize the Songpal device."""
         self._name = name
         self._dev = device
         self._sysinfo = None
         self._model = None
+        self._on_action = on_action
+        self._wol = wol
 
         self._state = False
         self._attr_available = False
         self._initialized = False
+        self._delay = INITIAL_RETRY_DELAY
 
         self._volume_control = None
         self._volume_min = 0
@@ -119,6 +143,10 @@ class SongpalEntity(MediaPlayerEntity):
         self._sources = {}
         self._active_sound_mode = None
         self._sound_modes = {}
+
+    def _reset_delay(self) -> None:
+        """Reset delay after turn_on_action called to speed up reconnecting."""
+        self._delay = INITIAL_RETRY_DELAY
 
     @override
     async def async_added_to_hass(self) -> None:
@@ -203,21 +231,28 @@ class SongpalEntity(MediaPlayerEntity):
                 self._dev.endpoint,
             )
             _LOGGER.debug("Disconnected: %s", connect.exception)
+            self._state = False
             self._attr_available = False
             self.async_write_ha_state()
 
             # Try to reconnect forever, a successful reconnect will initialize
             # the websocket connection again.
-            delay = INITIAL_RETRY_DELAY
+            self._reset_delay()
             while not self._attr_available:
+                delay = self._delay
                 _LOGGER.debug("Trying to reconnect in %s seconds", delay)
-                await asyncio.sleep(delay)
+                # Sleep in short steps, so that _reset_delay() (called after
+                # turning the device on) can cut the wait short
+                remaining = delay
+                while remaining > 0 and self._delay >= delay:
+                    await asyncio.sleep(min(remaining, INITIAL_RETRY_DELAY))
+                    remaining -= INITIAL_RETRY_DELAY
 
                 try:
                     await self._dev.get_supported_methods()
                 except SongpalException as ex:
                     _LOGGER.debug("Failed to reconnect: %s", ex)
-                    delay = min(2 * delay, 300)
+                    self._delay = min(2 * self._delay, 300)
                 else:
                     # We need to inform HA about the state in case we are coming
                     # back from a disconnected state.
@@ -272,6 +307,22 @@ class SongpalEntity(MediaPlayerEntity):
             name=self._name,
             sw_version=self._sysinfo.version,
         )
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return availability of the device."""
+        if (self._on_action or self._wol) and not self._attr_available:
+            # Report available when off, so that the device can be turned on
+            _LOGGER.debug(
+                "Device available is: %s but on_action set to %s and wol is %s"
+                " - returning True",
+                self._attr_available,
+                self._on_action,
+                self._wol,
+            )
+            return True
+        return self._attr_available
 
     async def async_set_sound_setting(self, name, value):
         """Change a setting on the device."""
@@ -412,6 +463,31 @@ class SongpalEntity(MediaPlayerEntity):
     @override
     async def async_turn_on(self) -> None:
         """Turn the device on."""
+        if self._wol:
+            data = {
+                CONF_MAC: self.unique_id,
+                CONF_BROADCAST_ADDRESS: urlparse(self._dev.endpoint).hostname,
+            }
+            _LOGGER.debug(
+                "Sending wake-on-lan packet to songpal device %s data %r",
+                self.name,
+                data,
+            )
+            await self.hass.services.async_call(
+                WOL_DOMAIN, SERVICE_SEND_MAGIC_PACKET, data, context=self._context
+            )
+            self._reset_delay()
+            return
+        if self._on_action:
+            _LOGGER.debug(
+                "Calling on_action %s for songpal device %s",
+                self._on_action,
+                self.name,
+            )
+            domain, service = self._on_action.split(".")
+            await self.hass.services.async_call(domain, service, context=self._context)
+            self._reset_delay()
+            return
         try:
             await self._dev.set_power(True)
         except SongpalException as ex:

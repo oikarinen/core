@@ -4,7 +4,12 @@ import copy
 import dataclasses
 from unittest.mock import patch
 
-from homeassistant.components.songpal.const import CONF_ENDPOINT, DOMAIN
+from homeassistant.components.songpal.const import (
+    CONF_ENDPOINT,
+    CONF_ON_ACTION,
+    CONF_WOL,
+    DOMAIN,
+)
 from homeassistant.config_entries import (
     SOURCE_IMPORT,
     SOURCE_SSDP,
@@ -68,6 +73,7 @@ def _patch_setup():
 
 async def test_flow_ssdp(hass: HomeAssistant) -> None:
     """Test working ssdp flow."""
+    mocked_device = _create_mocked_device()
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": SOURCE_SSDP},
@@ -82,13 +88,35 @@ async def test_flow_ssdp(hass: HomeAssistant) -> None:
     flow = _flow_next(hass, result["flow_id"])
     assert flow["context"]["unique_id"] == UDN
 
-    with _patch_setup():
+    with _patch_config_flow_device(mocked_device), _patch_setup():
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input={}
         )
         assert result["type"] is FlowResultType.CREATE_ENTRY
         assert result["title"] == FRIENDLY_NAME
         assert result["data"] == CONF_DATA
+
+    mocked_device.get_supported_methods.assert_called_once()
+    mocked_device.get_interface_information.assert_not_called()
+
+
+async def test_flow_ssdp_invalid(hass: HomeAssistant) -> None:
+    """Test ssdp flow aborting when the device cannot be reached."""
+    mocked_device = _create_mocked_device(True)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_SSDP},
+        data=SSDP_DATA,
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    with _patch_config_flow_device(mocked_device):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input={}
+        )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "cannot_connect"
 
 
 async def test_flow_user(hass: HomeAssistant) -> None:
@@ -118,6 +146,31 @@ async def test_flow_user(hass: HomeAssistant) -> None:
 
     mocked_device.get_supported_methods.assert_called_once()
     mocked_device.get_interface_information.assert_called_once()
+
+
+async def test_flow_user_host_only(hass: HomeAssistant) -> None:
+    """Test user flow with only the host of the device given."""
+    mocked_device = _create_mocked_device()
+
+    with (
+        _patch_config_flow_device(mocked_device) as device_cls,
+        _patch_setup(),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_USER},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={CONF_ENDPOINT: HOST},
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert result["data"] == {
+            CONF_NAME: MODEL,
+            CONF_ENDPOINT: ENDPOINT,
+        }
+
+    device_cls.assert_called_once_with(ENDPOINT)
 
 
 async def test_flow_import(hass: HomeAssistant) -> None:
@@ -201,7 +254,7 @@ async def test_user_exist(hass: HomeAssistant) -> None:
         assert result["reason"] == "already_configured"
 
     mocked_device.get_supported_methods.assert_called_once()
-    mocked_device.get_interface_information.assert_called_once()
+    mocked_device.get_interface_information.assert_not_called()
 
 
 async def test_import_exist(hass: HomeAssistant) -> None:
@@ -251,3 +304,38 @@ async def test_import_invalid(hass: HomeAssistant) -> None:
 
     mocked_device.get_supported_methods.assert_called_once()
     mocked_device.get_interface_information.assert_not_called()
+
+
+async def test_options_flow(hass: HomeAssistant) -> None:
+    """Test the options flow."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ENDPOINT, data=CONF_DATA)
+    entry.add_to_hass(hass)
+    hass.states.async_set("script.turn_on_soundbar", "off")
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_ON_ACTION: "script.turn_on_soundbar", CONF_WOL: True},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {
+        CONF_ON_ACTION: "script.turn_on_soundbar",
+        CONF_WOL: True,
+    }
+
+
+async def test_options_flow_script_not_found(hass: HomeAssistant) -> None:
+    """Test the options flow with a turn on script that does not exist."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=ENDPOINT, data=CONF_DATA)
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_ON_ACTION: "script.missing"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_ON_ACTION: "script_not_found"}
