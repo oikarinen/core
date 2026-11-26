@@ -179,7 +179,7 @@ class SongpalEntity(MediaPlayerEntity):
         async def _try_reconnect(connect: ConnectChange):
             _LOGGER.warning(
                 "[%s(%s)] Got disconnected, trying to reconnect",
-                self.name,
+                self._name,
                 self._dev.endpoint,
             )
             _LOGGER.debug("Disconnected: %s", connect.exception)
@@ -209,7 +209,7 @@ class SongpalEntity(MediaPlayerEntity):
                 "songpal-listen-notifications",
             )
             _LOGGER.warning(
-                "[%s(%s)] Connection reestablished", self.name, self._dev.endpoint
+                "[%s(%s)] Connection reestablished", self._name, self._dev.endpoint
             )
 
         self._dev.on_notification(VolumeChange, _volume_changed)
