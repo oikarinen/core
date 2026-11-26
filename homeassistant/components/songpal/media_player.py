@@ -211,7 +211,7 @@ class SongpalEntity(MediaPlayerEntity):
         async def _try_reconnect(connect: ConnectChange):
             _LOGGER.warning(
                 "[%s(%s)] Got disconnected, trying to reconnect",
-                self.name,
+                self._name,
                 self._dev.endpoint,
             )
             _LOGGER.debug("Disconnected: %s", connect.exception)

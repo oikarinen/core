@@ -438,6 +438,7 @@ async def test_disconnected(
 ) -> None:
     """Test disconnected behavior."""
     mocked_device = _create_mocked_device()
+    mocked_device.endpoint = ENDPOINT
     entry = MockConfigEntry(domain=songpal.DOMAIN, data=CONF_DATA)
     entry.add_to_hass(hass)
 
@@ -459,8 +460,14 @@ async def test_disconnected(
         await notification_callbacks[ConnectChange](connect_change)
     warning_records = [x for x in caplog.records if x.levelno == logging.WARNING]
     assert len(warning_records) == 2
-    assert warning_records[0].message.endswith("Got disconnected, trying to reconnect")
-    assert warning_records[1].message.endswith("Connection reestablished")
+    assert (
+        warning_records[0].message
+        == f"[{FRIENDLY_NAME}({ENDPOINT})] Got disconnected, trying to reconnect"
+    )
+    assert (
+        warning_records[1].message
+        == f"[{FRIENDLY_NAME}({ENDPOINT})] Connection reestablished"
+    )
     assert not any(x.levelno == logging.ERROR for x in caplog.records)
 
 
