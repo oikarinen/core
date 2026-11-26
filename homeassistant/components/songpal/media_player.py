@@ -37,6 +37,8 @@ from .helpers import async_get_turn_on_trigger
 _LOGGER = logging.getLogger(__name__)
 
 INITIAL_RETRY_DELAY = 10
+# Booting and joining the network takes minutes for some devices
+TURN_ON_RETRIES = 18
 
 
 async def async_setup_entry(
@@ -111,6 +113,7 @@ class SongpalEntity(MediaPlayerEntity):
         self._turn_on = PluggableAction(self.async_write_ha_state)
         self._retry_delay = INITIAL_RETRY_DELAY
         self._retry_now = asyncio.Event()
+        self._turn_on_retries = 0
 
         self._volume_control = None
         self._volume_min = 0
@@ -265,13 +268,17 @@ class SongpalEntity(MediaPlayerEntity):
                 await self._dev.get_supported_methods()
             except SongpalException as ex:
                 _LOGGER.debug("Failed to reconnect: %s", ex)
-                self._retry_delay = min(2 * self._retry_delay, 300)
+                if self._turn_on_retries:
+                    self._turn_on_retries -= 1
+                else:
+                    self._retry_delay = min(2 * self._retry_delay, 300)
             else:
                 self._methods_loaded = True
                 # We need to inform HA about the state in case we are coming
                 # back from a disconnected state.
                 await self.async_update_ha_state(force_refresh=True)
 
+        self._turn_on_retries = 0
         entry.async_create_background_task(
             self.hass,
             self._dev.listen_notifications(),
@@ -464,8 +471,9 @@ class SongpalEntity(MediaPlayerEntity):
         """Turn the device on."""
         if not self._attr_available and self._turn_on:
             await self._turn_on.async_run(self.hass, self._context)
-            # Try to reconnect sooner, as the device should be coming up
+            # Keep reconnecting often, as the device should be coming up
             self._retry_delay = INITIAL_RETRY_DELAY
+            self._turn_on_retries = TURN_ON_RETRIES
             self._retry_now.set()
             return
         try:
