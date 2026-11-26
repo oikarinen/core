@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import timedelta
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pytest_homeassistant.common import (
     MockConfigEntry,
@@ -145,7 +145,7 @@ async def test_turn_on_unreachable(
     mocked_device, device_id = await _setup_device(hass, device_registry)
     await _setup_turn_on_automation(hass, device_id)
     type(mocked_device).get_supported_methods = AsyncMock(
-        side_effect=[SongpalException(""), SongpalException(""), None]
+        side_effect=[SongpalException("")] * 5 + [None]
     )
     connect_change = MagicMock()
     connect_change.exception = "disconnected"
@@ -172,7 +172,8 @@ async def test_turn_on_unreachable(
     assert mocked_device.get_supported_methods.call_count == 2
     assert hass.states.get(ENTITY_ID).state == STATE_OFF
 
-    await _turn_on(hass)
+    with patch("homeassistant.components.songpal.media_player.TURN_ON_RETRIES", 2):
+        await _turn_on(hass)
 
     mocked_device.set_power.assert_not_called()
     assert len(service_calls) == 3
@@ -181,9 +182,17 @@ async def test_turn_on_unreachable(
     assert service_calls[2].data["some"] == device_id
     assert service_calls[2].data["id"] == 0
 
-    # The next attempt is after 10 seconds again instead of 40 seconds
+    # Reconnecting is retried every 10 seconds instead of after 40 seconds,
+    # for as many failures as there are turn on retries
+    for call_count in (3, 4, 5):
+        await _wait(hass, 11)
+        assert mocked_device.get_supported_methods.call_count == call_count
+
+    # Then the delay grows again
     await _wait(hass, 11)
-    assert mocked_device.get_supported_methods.call_count == 3
+    assert mocked_device.get_supported_methods.call_count == 5
+    await _wait(hass, 21)
+    assert mocked_device.get_supported_methods.call_count == 6
     await reconnect
     assert hass.states.get(ENTITY_ID).state == STATE_ON
 
